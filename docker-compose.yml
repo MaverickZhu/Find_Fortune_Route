@@ -1,0 +1,96 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-find_fortune_route}
+      POSTGRES_USER: ${POSTGRES_USER:-fortune}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fortune}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infra/db/init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fortune} -d ${POSTGRES_DB:-find_fortune_route}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fortune:fortune@db:5432/find_fortune_route}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AKSHARE_ENABLED: ${AKSHARE_ENABLED:-true}
+      DEFAULT_STOCK_POOL: ${DEFAULT_STOCK_POOL:-000001,600519,000858,601318,000333,300750,600036,600276}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fortune:fortune@db:5432/find_fortune_route}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AKSHARE_ENABLED: ${AKSHARE_ENABLED:-true}
+      DEFAULT_STOCK_POOL: ${DEFAULT_STOCK_POOL:-000001,600519,000858,601318,000333,300750,600036,600276}
+    depends_on:
+      - backend
+      - redis
+      - db
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app worker --loglevel=info
+
+  beat:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://fortune:fortune@db:5432/find_fortune_route}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AKSHARE_ENABLED: ${AKSHARE_ENABLED:-true}
+      DEFAULT_STOCK_POOL: ${DEFAULT_STOCK_POOL:-000001,600519,000858,601318,000333,300750,600036,600276}
+    depends_on:
+      - backend
+      - redis
+      - db
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+      INTERNAL_API_BASE_URL: ${INTERNAL_API_BASE_URL:-http://backend:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev
+
+volumes:
+  pgdata:
