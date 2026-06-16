@@ -1415,6 +1415,36 @@ mark {
   flex: 1;
 }
 
+.alertContent {
+  display: grid;
+  gap: 7px;
+  color: var(--ink);
+}
+
+.alertContent > strong {
+  color: var(--amber);
+  font-weight: 700;
+}
+
+.alertContent > span,
+.alertContent > small {
+  color: var(--muted);
+  line-height: 1.45;
+}
+
+.alertCandidateList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.alertCandidateList mark {
+  border: 1px solid rgba(198, 116, 19, 0.24);
+  border-radius: 8px;
+  padding: 5px 7px;
+  font-size: 12px;
+}
+
 .alertItem button {
   flex: 0 0 auto;
   padding: 5px 8px;
@@ -1430,6 +1460,11 @@ mark {
 
 .decisionRow button {
   background: #fff;
+}
+
+.decisionRow button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .learningBand,
@@ -2781,6 +2816,69 @@ dd {
   line-height: 1.5;
 }
 
+.holdingTradePlan {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 10px;
+  border-top: 1px solid rgba(29, 78, 216, 0.18);
+  padding-top: 12px;
+}
+
+.tradePlanHead {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.tradePlanHead strong,
+.tradePlanAdvice strong,
+.tradePlanAdvice span {
+  display: block;
+}
+
+.tradePlanHead strong {
+  margin-top: 3px;
+  font-size: 16px;
+  color: var(--ink);
+}
+
+.tradePlanLevels {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.tradePlanAdvice {
+  border: 1px solid rgba(29, 78, 216, 0.18);
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 10px 12px;
+}
+
+.tradePlanAdvice strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.tradePlanAdvice span {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  margin-top: 5px;
+}
+
+.tradePlanRules {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 16px;
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .manualSellBox {
   grid-column: 1 / -1;
   display: grid;
@@ -3178,6 +3276,8 @@ dd {
 
   .holdingInsight,
   .holdingStats,
+  .tradePlanLevels,
+  .tradePlanRules,
   .manualSellBox {
     grid-template-columns: 1fr;
   }
@@ -3242,6 +3342,8 @@ dd {
   .detailGrid.compact,
   .decisionStrip,
   .stockSummary,
+  .tradePlanLevels,
+  .tradePlanRules,
   .strategyRiskGrid,
   .backtestDetailGrid {
     grid-template-columns: 1fr;

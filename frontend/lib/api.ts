@@ -613,6 +613,20 @@ export type PortfolioPosition = {
   latest_quote_at?: string | null;
   quote_source?: string | null;
   meta: Record<string, unknown>;
+  trade_plan?: {
+    strategy_code?: string | null;
+    strategy_name?: string | null;
+    source?: string | null;
+    entry_basis?: string | null;
+    current_advice?: string | null;
+    entry_price?: number | null;
+    target_sell?: number | null;
+    stop_loss?: number | null;
+    take_profit?: number | null;
+    latest_signal_action?: string | null;
+    latest_signal_score?: number | null;
+    rules?: string[];
+  } | null;
 };
 
 export type StrategyTradeSummary = {
@@ -815,13 +829,16 @@ export async function deleteWatchlistItem(id: number): Promise<void> {
 
 export async function evaluateAlerts(): Promise<void> {
   const baseUrl = apiBaseUrl();
-  await fetch(`${baseUrl}/api/alerts/evaluate`, { method: "POST", cache: "no-store" });
+  const response = await fetch(`${baseUrl}/api/alerts/evaluate`, { method: "POST", cache: "no-store" });
+  if (!response.ok) {
+    throw new Error("Alert evaluate API unavailable");
+  }
 }
 
 export async function dismissAlert(id: number): Promise<void> {
   const baseUrl = apiBaseUrl();
   const response = await fetch(`${baseUrl}/api/alerts/${id}/dismiss`, { method: "POST", cache: "no-store" });
-  if (!response.ok) {
+  if (!response.ok && response.status !== 404) {
     throw new Error("Alert dismiss API unavailable");
   }
 }
@@ -835,6 +852,9 @@ export async function recordAlertDecision(id: number, action: "buy" | "sell" | "
     cache: "no-store"
   });
   if (!response.ok) {
+    if (response.status === 404) {
+      throw new Error("该提醒已被处理或同步清理，页面已刷新到最新状态。");
+    }
     throw new Error("Alert decision API unavailable");
   }
   return response.json();

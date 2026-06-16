@@ -688,7 +688,7 @@ def evaluate_alerts(db: Session = Depends(get_db)) -> dict[str, int]:
 def dismiss_alert(alert_id: int, db: Session = Depends(get_db)) -> dict[str, int]:
     alert = db.get(Alert, alert_id)
     if alert is None:
-        raise HTTPException(status_code=404, detail="Alert not found")
+        return {"dismissed": alert_id, "stale": 1}
     alert.status = AlertStatus.dismissed
     db.commit()
-    return {"dismissed": alert_id}
+    return {"dismissed": alert_id, "stale": 0}

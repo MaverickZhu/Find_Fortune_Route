@@ -4,7 +4,15 @@ from typing import Any
 from sqlalchemy import and_, func, select
 from sqlalchemy.orm import Session
 
-from app.models.domain import MarketQuote, PortfolioPosition, PositionStatus, TradeAction, UserTradeSample
+from app.models.domain import (
+    MarketQuote,
+    PortfolioPosition,
+    PositionStatus,
+    Strategy,
+    StrategySignal,
+    TradeAction,
+    UserTradeSample,
+)
 from app.services.market_data import MarketDataProvider
 
 
@@ -44,8 +52,8 @@ class PortfolioService:
         self._apply_corporate_actions(db, open_positions)
         quote_map = self._latest_quotes(db, [item.symbol for item in open_positions + closed_positions])
         quote_map.update(self._fresh_open_quotes(open_positions))
-        open_payloads = [self.serialize(item, quote_map.get(item.symbol)) for item in open_positions]
-        closed_history_payloads = [self.serialize(item, quote_map.get(item.symbol)) for item in closed_positions[:40]]
+        open_payloads = [self.serialize(item, quote_map.get(item.symbol), db=db) for item in open_positions]
+        closed_history_payloads = [self.serialize(item, quote_map.get(item.symbol), db=db) for item in closed_positions[:40]]
         closed_payloads = closed_history_payloads[:8]
         realized = [item.realized_return_pct for item in closed_positions if item.realized_return_pct is not None]
         floating_values = [item.get("floating_pnl") for item in open_payloads if item.get("floating_pnl") is not None]
@@ -103,7 +111,12 @@ class PortfolioService:
             reverse=True,
         )
 
-    def serialize(self, position: PortfolioPosition, quote: MarketQuote | dict[str, Any] | None = None) -> dict[str, Any]:
+    def serialize(
+        self,
+        position: PortfolioPosition,
+        quote: MarketQuote | dict[str, Any] | None = None,
+        db: Session | None = None,
+    ) -> dict[str, Any]:
         current_price = self._quote_float(quote, "last_price")
         floating_return_pct = None
         floating_pnl = None
@@ -141,7 +154,171 @@ class PortfolioService:
             "latest_quote_at": self._quote_datetime_iso(quote, "observed_at"),
             "quote_source": self._quote_text(quote, "source"),
             "meta": position.meta,
+            "trade_plan": self._trade_plan(db, position, quote, floating_return_pct) if db else None,
         }
+
+    def _trade_plan(
+        self,
+        db: Session,
+        position: PortfolioPosition,
+        quote: MarketQuote | dict[str, Any] | None,
+        floating_return_pct: float | None,
+    ) -> dict[str, Any]:
+        strategy = self._strategy(db, position.strategy_code)
+        entry_features = self._entry_features(position)
+        entry_signal = entry_features.get("signal") if isinstance(entry_features.get("signal"), dict) else {}
+        alert = entry_features.get("alert") if isinstance(entry_features.get("alert"), dict) else {}
+        decision_target = entry_features.get("decision_target") if isinstance(entry_features.get("decision_target"), dict) else {}
+        latest_signal = self._latest_signal(db, position.symbol, position.strategy_code)
+        risk_rules = strategy.risk_rules if strategy and isinstance(strategy.risk_rules, dict) else {}
+        defaults = self._strategy_plan_defaults(position.strategy_code)
+
+        stop_loss_pct = self._as_float(risk_rules.get("stop_loss_pct")) or self._as_float(risk_rules.get("trailing_stop_pct"))
+        take_profit_pct = self._as_float(risk_rules.get("take_profit_pct"))
+        if stop_loss_pct is None:
+            stop_loss_pct = defaults["stop_loss_pct"]
+        if take_profit_pct is None:
+            take_profit_pct = defaults["take_profit_pct"]
+        target_sell_pct = defaults["target_sell_pct"]
+
+        entry_price = float(position.entry_price or 0)
+        current_price = self._quote_float(quote, "last_price")
+        stop_loss = self._price_from_pct(entry_price, stop_loss_pct)
+        target_sell = self._price_from_pct(entry_price, target_sell_pct)
+        take_profit = self._price_from_pct(entry_price, take_profit_pct)
+        action = latest_signal.action.value if latest_signal and hasattr(latest_signal.action, "value") else latest_signal.action if latest_signal else None
+        score = latest_signal.score if latest_signal else self._as_float(entry_signal.get("score"))
+
+        return {
+            "strategy_code": position.strategy_code,
+            "strategy_name": strategy.name if strategy else (position.strategy_code or "未绑定策略"),
+            "source": self._plan_source(alert, decision_target),
+            "entry_basis": self._entry_basis(entry_signal, alert, decision_target, strategy),
+            "current_advice": self._current_advice(
+                current_price=current_price,
+                stop_loss=stop_loss,
+                target_sell=target_sell,
+                take_profit=take_profit,
+                floating_return_pct=floating_return_pct,
+                latest_action=action,
+            ),
+            "entry_price": round(entry_price, 2) if entry_price else None,
+            "target_sell": target_sell,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "latest_signal_action": action,
+            "latest_signal_score": round(score, 1) if score is not None else None,
+            "rules": self._plan_rules(position.strategy_code, risk_rules),
+        }
+
+    def _strategy(self, db: Session, strategy_code: str | None) -> Any | None:
+        if not strategy_code:
+            return None
+        return db.execute(select(Strategy).where(Strategy.code == strategy_code).limit(1)).scalars().first()
+
+    def _latest_signal(self, db: Session, symbol: str, strategy_code: str | None) -> StrategySignal | None:
+        query = select(StrategySignal).where(StrategySignal.symbol == symbol)
+        if strategy_code:
+            query = query.where(StrategySignal.strategy_code == strategy_code)
+        return db.execute(query.order_by(StrategySignal.generated_at.desc()).limit(1)).scalars().first()
+
+    def _entry_features(self, position: PortfolioPosition) -> dict[str, Any]:
+        meta = position.meta if isinstance(position.meta, dict) else {}
+        features = meta.get("entry_features")
+        return features if isinstance(features, dict) else {}
+
+    def _plan_source(self, alert: dict[str, Any], decision_target: dict[str, Any]) -> str:
+        if decision_target.get("source") == "sector_linkage_primary_candidate":
+            return "板块联动快速买入路径"
+        alert_type = str(alert.get("type") or "")
+        if alert_type.startswith("sector_linkage"):
+            return "板块联动快速买入路径"
+        if alert_type:
+            return "自选追踪提醒"
+        return "用户主动记录"
+
+    def _entry_basis(
+        self,
+        entry_signal: dict[str, Any],
+        alert: dict[str, Any],
+        decision_target: dict[str, Any],
+        strategy: Any | None,
+    ) -> str:
+        for value in [
+            decision_target.get("reason"),
+            entry_signal.get("reason"),
+            alert.get("message"),
+            strategy.description if strategy else None,
+        ]:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return "按买入时策略信号进入模拟持仓，后续以目标卖出、止损和止盈线跟踪。"
+
+    def _current_advice(
+        self,
+        current_price: float | None,
+        stop_loss: float | None,
+        target_sell: float | None,
+        take_profit: float | None,
+        floating_return_pct: float | None,
+        latest_action: str | None,
+    ) -> str:
+        if current_price is not None and stop_loss is not None and current_price <= stop_loss:
+            return "已触及或接近止损线，优先确认是否卖出。"
+        if current_price is not None and take_profit is not None and current_price >= take_profit:
+            return "已达到止盈区间，可考虑分批兑现或上移保护线。"
+        if current_price is not None and target_sell is not None and current_price >= target_sell:
+            return "已进入卖出观察区，建议结合量能与板块强弱确认。"
+        if latest_action == "sell":
+            return "最新策略信号偏卖出，建议降低仓位或等待重新确认。"
+        if latest_action in {"buy", "hold"}:
+            return "最新策略信号仍支持持有，继续跟踪目标价和止损线。"
+        if floating_return_pct is not None and floating_return_pct < -3:
+            return "浮亏扩大，需重点观察是否跌破策略保护线。"
+        return "未触发明确买卖线，继续按策略计划观察。"
+
+    def _plan_rules(self, strategy_code: str | None, risk_rules: dict[str, Any]) -> list[str]:
+        rules = [
+            "最终买卖由用户确认，系统仅提供策略辅助提醒。",
+            "A 股 T+1、涨跌停和流动性会影响实际可成交性。",
+        ]
+        if strategy_code == "institutional_crowding":
+            rules.insert(0, "机构抱团股需同步观察板块联动、量能放大和抱团资金是否松动。")
+            rules.insert(1, "若快速拉升后量价背离，优先防范诱多和冲高回落。")
+        elif strategy_code == "trend_breakout":
+            rules.insert(0, "趋势突破策略优先跟踪突破后是否继续放量站稳。")
+        elif strategy_code == "mean_reversion":
+            rules.insert(0, "反转策略以修复为主，若修复失败应更严格执行止损。")
+        if risk_rules:
+            rules.append(f"策略风控参数：{risk_rules}")
+        return rules
+
+    def _strategy_plan_defaults(self, strategy_code: str | None) -> dict[str, float]:
+        defaults = {
+            "target_sell_pct": 6.0,
+            "take_profit_pct": 12.0,
+            "stop_loss_pct": -6.0,
+        }
+        by_strategy = {
+            "multi_factor_alpha": {"target_sell_pct": 8.0, "take_profit_pct": 18.0, "stop_loss_pct": -8.0},
+            "mean_reversion": {"target_sell_pct": 5.0, "take_profit_pct": 9.0, "stop_loss_pct": -5.0},
+            "low_vol_quality": {"target_sell_pct": 5.0, "take_profit_pct": 10.0, "stop_loss_pct": -5.0},
+            "money_flow_anomaly": {"target_sell_pct": 6.0, "take_profit_pct": 12.0, "stop_loss_pct": -6.0},
+            "event_driven_watch": {"target_sell_pct": 5.0, "take_profit_pct": 10.0, "stop_loss_pct": -6.0},
+            "institutional_crowding": {"target_sell_pct": 8.0, "take_profit_pct": 14.0, "stop_loss_pct": -6.0},
+        }
+        return {**defaults, **by_strategy.get(strategy_code or "", {})}
+
+    def _price_from_pct(self, entry_price: float, pct: float | None) -> float | None:
+        if entry_price <= 0 or pct is None:
+            return None
+        return round(entry_price * (1 + pct / 100), 2)
+
+    def _as_float(self, value: Any) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _fresh_open_quotes(self, positions: list[PortfolioPosition]) -> dict[str, dict[str, Any]]:
         symbols = sorted({item.symbol for item in positions if item.symbol})

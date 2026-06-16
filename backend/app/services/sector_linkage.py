@@ -1016,15 +1016,30 @@ class SectorLinkageService:
                 continue
             trigger = group["trigger_symbols"][0]
             top_items = group["items"][:3]
-            names = "、".join(f"{item['name']}({item['symbol']})" for item in top_items)
+            primary = top_items[0]
+            candidate_names = "、".join(
+                f"{item['name']}({item['symbol']}) {float(item.get('score') or 0):.1f}分" for item in top_items
+            )
+            trigger_names = "、".join(
+                f"{item['name']}({item['symbol']})" for item in group.get("trigger_symbols", [])[:3]
+            )
+            group["primary_candidate"] = primary
             db.add(
                 Alert(
-                    symbol=trigger["symbol"],
+                    symbol=primary["symbol"],
                     alert_type=alert_type,
-                    message=f"{group['sector']} 出现机构抱团股{self._alert_trigger_text(group)}，未动作候选：{names}。",
+                    message=(
+                        f"{group['sector']} 推荐关注/买入候选：{candidate_names}；"
+                        f"依据触发股：{trigger_names} {self._alert_trigger_text(group)}。"
+                    ),
                     status=AlertStatus.triggered,
                     triggered_at=datetime.utcnow(),
-                    payload={"sector_linkage": group, "source": "institutional_sector_linkage_scan"},
+                    payload={
+                        "sector_linkage": group,
+                        "primary_candidate": primary,
+                        "trigger_basis": group.get("trigger_symbols", [])[:5],
+                        "source": "institutional_sector_linkage_scan",
+                    },
                 )
             )
         db.commit()

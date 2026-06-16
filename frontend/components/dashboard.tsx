@@ -193,17 +193,27 @@ export default function DashboardClient({ initial }: { initial: Dashboard }) {
     try {
       await dismissAlert(id);
       await reloadDashboard();
-    } catch {
-      setWatchNotice("提醒处理失败，请稍后重试。");
+    } catch (error) {
+      setWatchNotice(error instanceof Error ? error.message : "提醒处理失败，请稍后重试。");
     }
   }
 
   async function decideAlert(id: number, action: "buy" | "sell" | "ignore" | "watch") {
     try {
-      await recordAlertDecision(id, action, undefined, action === "buy" || action === "sell" ? 100 : undefined);
+      const sample = await recordAlertDecision(id, action, undefined, action === "buy" || action === "sell" ? 100 : undefined);
       await reloadDashboard();
-    } catch {
-      setWatchNotice("决策记录失败，请稍后重试。");
+      if (action === "sell") {
+        if (sample.status === "no_open_position") {
+          setWatchNotice(`${sample.symbol} 未在当前虚拟持仓中，无法生成最近完成记录；本次只记录为无持仓卖出决策。`);
+        } else if (sample.status === "position_reduced") {
+          setWatchNotice(`${sample.symbol} 已部分卖出，剩余持仓仍在当前持仓中，完全卖出后才会进入最近完成。`);
+        } else if (sample.status === "position_closed") {
+          setWatchNotice(`${sample.symbol} 已完成卖出并进入最近完成记录。`);
+        }
+      }
+    } catch (error) {
+      await reloadDashboard("提醒列表已刷新，请按最新状态继续操作。");
+      setWatchNotice(error instanceof Error ? error.message : "决策记录失败，请稍后重试。");
     }
   }
 
@@ -838,21 +848,31 @@ export default function DashboardClient({ initial }: { initial: Dashboard }) {
             <div className="alertList">
               {data.alerts.length === 0 ? (
                 <div className="empty">暂无触发提醒。系统会持续检查价格、策略和风险事件。</div>
-              ) : data.alerts.map((alert) => (
+              ) : data.alerts.map((alert) => {
+                const targetSymbol = alertDecisionSymbol(alert);
+                const hasOpenPosition = portfolio.open_positions.some((item) => item.symbol === targetSymbol);
+                return (
                 <div className="alertItem" key={alert.id}>
                   <Bell size={16} />
-                  <span>{alert.message}</span>
+                  <AlertMessage alert={alert} />
                   <button onClick={() => acknowledgeAlert(alert.id)} title="确认提醒">
                     <Check size={14} />
                     <span>确认</span>
                   </button>
                   <div className="decisionRow">
                     <button onClick={() => decideAlert(alert.id, "buy")}>买入</button>
-                    <button onClick={() => decideAlert(alert.id, "sell")}>卖出</button>
+                    <button
+                      disabled={!hasOpenPosition}
+                      onClick={() => decideAlert(alert.id, "sell")}
+                      title={hasOpenPosition ? "按当前虚拟持仓卖出" : `${targetSymbol} 不在当前持仓中，无法生成最近完成记录`}
+                    >
+                      卖出
+                    </button>
                     <button onClick={() => decideAlert(alert.id, "ignore")}>忽略</button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </Panel>
@@ -1947,6 +1967,88 @@ function KeyValueList({ data }: { data: Record<string, unknown> }) {
   );
 }
 
+function recordValue(value: unknown, key?: string): Record<string, unknown> | null {
+  const target = key && value && typeof value === "object"
+    ? (value as Record<string, unknown>)[key]
+    : value;
+  return target && typeof target === "object" && !Array.isArray(target) ? target as Record<string, unknown> : null;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+function nullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function AlertMessage({ alert }: { alert: Dashboard["alerts"][number] }) {
+  const sectorAlert = sectorAlertDetails(alert);
+  if (!sectorAlert) {
+    return <span>{alert.message}</span>;
+  }
+  return (
+    <div className="alertContent">
+      <strong>{sectorAlert.sector} 策略提示：推荐关注/买入候选</strong>
+      <div className="alertCandidateList">
+        {sectorAlert.candidates.map((item, index) => (
+          <mark key={`${item.symbol}-${index}`}>
+            {index + 1}. {item.name}({item.symbol}) · {actionLabel[item.action] ?? item.action} · {formatFactorValue(item.score, 1)}分
+          </mark>
+        ))}
+      </div>
+      {sectorAlert.triggers.length > 0 && (
+        <small>
+          依据触发股：{sectorAlert.triggers.map((item) => `${item.name}(${item.symbol})`).join("、")} · {sectorAlert.triggerText}
+        </small>
+      )}
+      <span>{alert.message}</span>
+    </div>
+  );
+}
+
+function alertDecisionSymbol(alert: Dashboard["alerts"][number]): string {
+  return sectorAlertDetails(alert)?.candidates[0]?.symbol || alert.symbol;
+}
+
+function sectorAlertDetails(alert: Dashboard["alerts"][number]): {
+  sector: string;
+  candidates: Array<{ symbol: string; name: string; action: string; score: number | null }>;
+  triggers: Array<{ symbol: string; name: string }>;
+  triggerText: string;
+} | null {
+  const payload = alert.payload ?? {};
+  const sectorLinkage = recordValue(payload, "sector_linkage");
+  if (!sectorLinkage) return null;
+  const sector = stringValue(sectorLinkage.sector) || "板块联动";
+  const items = Array.isArray(sectorLinkage.items) ? sectorLinkage.items : [];
+  const candidates = items
+    .map((item) => recordValue(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 3)
+    .map((item) => ({
+      symbol: stringValue(item.symbol),
+      name: stringValue(item.name) || stringValue(item.symbol),
+      action: stringValue(item.action) || "watch",
+      score: nullableNumber(item.score),
+    }))
+    .filter((item) => item.symbol);
+  if (candidates.length === 0) return null;
+  const triggerItems = Array.isArray(sectorLinkage.trigger_symbols) ? sectorLinkage.trigger_symbols : [];
+  const triggers = triggerItems
+    .map((item) => recordValue(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .slice(0, 3)
+    .map((item) => ({
+      symbol: stringValue(item.symbol),
+      name: stringValue(item.name) || stringValue(item.symbol),
+    }))
+    .filter((item) => item.symbol);
+  const triggerTypes = Array.isArray(sectorLinkage.trigger_types) ? sectorLinkage.trigger_types : [];
+  const triggerText = triggerTypes.map((item) => triggerTypeLabel(String(item))).join("、") || "板块联动";
+  return { sector, candidates, triggers, triggerText };
+}
+
 function formatValue(value: unknown): string {
   if (Array.isArray(value)) return value.join(", ");
   if (value && typeof value === "object") {
@@ -2146,6 +2248,38 @@ function StockDetailModal({
                 {cashDividendTotal(holdingPosition) != null && (
                   <div className="holdingAdjustmentNote">
                     已按除权除息同步调整持仓股数与成本，累计分红权益 {formatMoney(cashDividendTotal(holdingPosition))} 已计入浮动收益口径。
+                  </div>
+                )}
+                {holdingPosition.trade_plan && (
+                  <div className="holdingTradePlan">
+                    <div className="tradePlanHead">
+                      <div>
+                        <span className="eyebrow">持仓买卖策略</span>
+                        <strong>{holdingPosition.trade_plan.strategy_name || holdingPosition.strategy_code || "未绑定策略"}</strong>
+                      </div>
+                      <mark>{holdingPosition.trade_plan.source || "策略持仓"}</mark>
+                    </div>
+                    <div className="tradePlanLevels">
+                      <SummaryCell label="买入成本" value={formatOptionalNumber(holdingPosition.trade_plan.entry_price, "")} />
+                      <SummaryCell label="卖出观察" value={formatOptionalNumber(holdingPosition.trade_plan.target_sell, "")} tone="positive" />
+                      <SummaryCell label="止损保护" value={formatOptionalNumber(holdingPosition.trade_plan.stop_loss, "")} tone="negative" />
+                      <SummaryCell label="止盈区间" value={formatOptionalNumber(holdingPosition.trade_plan.take_profit, "")} tone="positive" />
+                      <SummaryCell
+                        label="最新策略分"
+                        value={holdingPosition.trade_plan.latest_signal_score == null ? "-" : holdingPosition.trade_plan.latest_signal_score.toFixed(1)}
+                      />
+                    </div>
+                    <div className="tradePlanAdvice">
+                      <strong>{holdingPosition.trade_plan.current_advice || "继续按策略计划观察。"}</strong>
+                      <span>{holdingPosition.trade_plan.entry_basis || "按买入时策略信号进入模拟持仓。"}</span>
+                    </div>
+                    {(holdingPosition.trade_plan.rules ?? []).length > 0 && (
+                      <ul className="tradePlanRules">
+                        {(holdingPosition.trade_plan.rules ?? []).slice(0, 4).map((rule) => (
+                          <li key={rule}>{rule}</li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                 )}
                 <form className="manualSellBox" onSubmit={submitManualSell}>

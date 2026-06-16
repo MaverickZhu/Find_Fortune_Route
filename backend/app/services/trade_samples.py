@@ -30,18 +30,20 @@ class TradeSampleService:
         quantity: int | None = None,
         notes: str | None = None,
     ) -> UserTradeSample:
+        decision_target = self._decision_target_from_alert(alert)
+        target_symbol = decision_target.get("symbol") or alert.symbol
         quote = (
             db.execute(
                 select(MarketQuote)
-                .where(MarketQuote.symbol == alert.symbol)
+                .where(MarketQuote.symbol == target_symbol)
                 .order_by(MarketQuote.observed_at.desc())
                 .limit(1)
             )
             .scalars()
             .first()
         )
-        inherited_strategy_code = self._strategy_code_from_alert(db, alert)
-        signal_query = select(StrategySignal).where(StrategySignal.symbol == alert.symbol)
+        inherited_strategy_code = decision_target.get("strategy_code") or self._strategy_code_from_alert(db, alert)
+        signal_query = select(StrategySignal).where(StrategySignal.symbol == target_symbol)
         if inherited_strategy_code:
             signal_query = signal_query.where(StrategySignal.strategy_code == inherited_strategy_code)
         signal = (
@@ -55,7 +57,7 @@ class TradeSampleService:
             signal = (
                 db.execute(
                     select(StrategySignal)
-                    .where(StrategySignal.symbol == alert.symbol)
+                    .where(StrategySignal.symbol == target_symbol)
                     .order_by(StrategySignal.generated_at.desc())
                     .limit(1)
                 )
@@ -63,11 +65,13 @@ class TradeSampleService:
                 .first()
             )
         strategy_code = inherited_strategy_code or (signal.strategy_code if signal else None)
-        quote_payload = self._quote_payload(alert.symbol, quote)
+        quote_payload = self._quote_payload(target_symbol, quote)
+        if decision_target.get("name") and not quote_payload.get("name"):
+            quote_payload["name"] = decision_target["name"]
         quality_level, quality_message = DataQualityService().assess_quote(quote_payload)
         market_rules = MarketRuleService().evaluate_quote(quote_payload, db=db)
         sample = UserTradeSample(
-            symbol=alert.symbol,
+            symbol=target_symbol,
             action=TradeAction(action),
             alert_id=alert.id,
             decision_price=float(quote_payload["last_price"]),
@@ -83,7 +87,9 @@ class TradeSampleService:
                     "message": alert.message,
                     "payload": alert.payload,
                     "triggered_at": alert.triggered_at.isoformat() if alert.triggered_at else None,
+                    "alert_symbol": alert.symbol,
                 },
+                "decision_target": decision_target,
                 "quote": quote_payload,
                 "signal": self._signal_payload(signal),
                 "data_quality": {
@@ -102,6 +108,25 @@ class TradeSampleService:
         db.commit()
         db.refresh(sample)
         return sample
+
+    def _decision_target_from_alert(self, alert: Alert) -> dict[str, Any]:
+        payload = alert.payload if isinstance(alert.payload, dict) else {}
+        primary = payload.get("primary_candidate")
+        if not isinstance(primary, dict):
+            sector_linkage = payload.get("sector_linkage")
+            items = sector_linkage.get("items") if isinstance(sector_linkage, dict) else None
+            primary = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else None
+        if not isinstance(primary, dict):
+            return {"symbol": alert.symbol}
+        return {
+            "symbol": str(primary.get("symbol") or alert.symbol),
+            "name": str(primary.get("name") or ""),
+            "strategy_code": primary.get("strategy_code"),
+            "action": primary.get("action"),
+            "score": primary.get("score"),
+            "reason": primary.get("reason"),
+            "source": "sector_linkage_primary_candidate",
+        }
 
     def apply_manual_trade(self, db: Session, sample: UserTradeSample) -> UserTradeSample:
         portfolio_event = PortfolioService().apply_trade_sample(db, sample)

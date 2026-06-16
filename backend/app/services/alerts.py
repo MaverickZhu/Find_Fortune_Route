@@ -32,12 +32,13 @@ class AlertService:
             }
             market_rules = MarketRuleService().evaluate_quote(quote_payload, db=db)
             signal = self._latest_signal(db, item.symbol, item.strategy_code)
-            for alert_type, message in self._messages(item, quote):
+            for alert_type, threshold, message in self._messages(item, quote):
+                alert_key = self._alert_key(item, alert_type, threshold)
                 existing = db.execute(
                     select(Alert)
                     .where(
                         Alert.symbol == item.symbol,
-                        Alert.alert_type == alert_type,
+                        Alert.alert_type == alert_key,
                     )
                     .limit(1)
                 ).scalar_one_or_none()
@@ -45,12 +46,14 @@ class AlertService:
                     continue
                 alert = Alert(
                     symbol=item.symbol,
-                    alert_type=alert_type,
+                    alert_type=alert_key,
                     message=message,
                     status=AlertStatus.triggered,
                     triggered_at=datetime.utcnow(),
                     payload={
                         "watchlist_id": item.id,
+                        "base_alert_type": alert_type,
+                        "threshold": threshold,
                         "strategy_code": item.strategy_code,
                         "price": quote.last_price,
                         "change_pct": quote.change_pct,
@@ -66,17 +69,20 @@ class AlertService:
         db.commit()
         return triggered
 
-    def _messages(self, item: WatchlistItem, quote: MarketQuote) -> list[tuple[str, str]]:
-        messages: list[tuple[str, str]] = []
+    def _messages(self, item: WatchlistItem, quote: MarketQuote) -> list[tuple[str, float, str]]:
+        messages: list[tuple[str, float, str]] = []
         if item.target_buy is not None and quote.last_price <= item.target_buy:
-            messages.append(("target_buy", f"{item.symbol} 已到达买入观察价 {item.target_buy}，当前 {quote.last_price}。"))
+            messages.append(("target_buy", item.target_buy, f"{item.symbol} 已到达买入观察价 {item.target_buy}，当前 {quote.last_price}。"))
         if item.target_sell is not None and quote.last_price >= item.target_sell:
-            messages.append(("target_sell", f"{item.symbol} 已到达卖出观察价 {item.target_sell}，当前 {quote.last_price}。"))
+            messages.append(("target_sell", item.target_sell, f"{item.symbol} 已到达卖出观察价 {item.target_sell}，当前 {quote.last_price}。"))
         if item.stop_loss is not None and quote.last_price <= item.stop_loss:
-            messages.append(("stop_loss", f"{item.symbol} 触发止损观察价 {item.stop_loss}，当前 {quote.last_price}。"))
+            messages.append(("stop_loss", item.stop_loss, f"{item.symbol} 触发止损观察价 {item.stop_loss}，当前 {quote.last_price}。"))
         if item.take_profit is not None and quote.last_price >= item.take_profit:
-            messages.append(("take_profit", f"{item.symbol} 触发止盈观察价 {item.take_profit}，当前 {quote.last_price}。"))
+            messages.append(("take_profit", item.take_profit, f"{item.symbol} 触发止盈观察价 {item.take_profit}，当前 {quote.last_price}。"))
         return messages
+
+    def _alert_key(self, item: WatchlistItem, alert_type: str, threshold: float) -> str:
+        return f"{alert_type}:{item.id}:{threshold:.4f}"
 
     def _latest_signal(self, db: Session, symbol: str, strategy_code: str | None) -> StrategySignal | None:
         query = select(StrategySignal).where(StrategySignal.symbol == symbol)
